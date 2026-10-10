@@ -1,0 +1,144 @@
+syntax = "proto3";
+
+package filesync.v1;
+
+option go_package = "filesync-prototype/api/filesync/v1;filesyncv1";
+
+service FileSync {
+  rpc RegisterDevice(RegisterDeviceRequest) returns (RegisterDeviceResponse);
+  rpc GetSyncPlan(GetSyncPlanRequest) returns (GetSyncPlanResponse);
+  rpc UploadFile(stream UploadFrame) returns (UploadFileResponse);
+  rpc DownloadFile(DownloadFileRequest) returns (stream FileChunk);
+  rpc WatchChanges(WatchChangesRequest) returns (stream ChangeEvent);
+  rpc CommitSync(CommitSyncRequest) returns (CommitSyncResponse);
+}
+
+enum SyncAction {
+  SYNC_ACTION_UNSPECIFIED = 0;
+  UPLOAD = 1;
+  DELETE_REMOTE = 2;
+  NO_OP = 3;
+  DOWNLOAD = 4;
+}
+
+enum ChangeKind {
+  CHANGE_KIND_UNSPECIFIED = 0;
+  FILE_UPDATED = 1;
+  FILE_DELETED = 2;
+}
+
+enum CommitKind {
+  COMMIT_KIND_UNSPECIFIED = 0;
+  UPSERT = 1;
+  DELETE = 2;
+}
+
+message RegisterDeviceRequest {
+  string device_id = 1;
+  string device_name = 2;
+  string platform = 3;
+}
+
+message RegisterDeviceResponse {
+  string device_id = 1;
+  string user_id = 2;
+}
+
+message ManifestEntry {
+  string path = 1;
+  string sha256 = 2;
+  string local_revision = 3;
+  bool deleted = 4;
+}
+
+message GetSyncPlanRequest {
+  string device_id = 1;
+  repeated ManifestEntry entries = 2;
+}
+
+message PlannedChange {
+  string path = 1;
+  SyncAction action = 2;
+  string server_revision = 3;
+  string server_sha256 = 4;
+  string reason = 5;
+}
+
+message GetSyncPlanResponse {
+  string sync_id = 1;
+  repeated PlannedChange changes = 2;
+}
+
+message UploadHeader {
+  string sync_id = 1;
+  string device_id = 2;
+  string path = 3;
+  string sha256 = 4;
+  int64 size = 5;
+  string base_revision = 6;
+}
+
+message UploadFrame {
+  oneof payload {
+    UploadHeader header = 1;
+    bytes chunk = 2;
+  }
+}
+
+message UploadFileResponse {
+  string sync_id = 1;
+  string path = 2;
+  int64 bytes_received = 3;
+  string sha256 = 4;
+}
+
+message DownloadFileRequest {
+  string device_id = 1;
+  string path = 2;
+  string revision = 3;
+}
+
+message FileChunk {
+  string path = 1;
+  string revision = 2;
+  int64 offset = 3;
+  bytes data = 4;
+  bool last = 5;
+}
+
+message WatchChangesRequest {
+  string device_id = 1;
+  string after_revision = 2;
+}
+
+message ChangeEvent {
+  ChangeKind kind = 1;
+  string path = 2;
+  string revision = 3;
+  string sha256 = 4;
+  string branch = 5;
+}
+
+message CommitOperation {
+  CommitKind kind = 1;
+  string path = 2;
+  string sync_id = 3;
+  string base_revision = 4;
+}
+
+message CommitSyncRequest {
+  string sync_id = 1;
+  string device_id = 2;
+  repeated CommitOperation operations = 3;
+}
+
+message CommitResult {
+  string path = 1;
+  string revision = 2;
+  string branch = 3;
+  bool conflict = 4;
+}
+
+message CommitSyncResponse {
+  repeated CommitResult results = 1;
+}

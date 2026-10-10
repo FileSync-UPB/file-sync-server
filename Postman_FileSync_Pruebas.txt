@@ -1,0 +1,168 @@
+PRUEBAS POSTMAN - FILE SYNC (gRPC)
+=================================
+
+Configuracion de la conexion
+----------------------------
+Servidor: localhost:8443
+TLS: activado
+Certificado autofirmado: desactivar la verificacion del certificado para esta prueba local
+Service Definition: importar api/filesync/v1/filesync.proto; no usar Server Reflection
+Authorization: Bearer Token
+Token: token
+
+Si se usa Metadata en vez de Authorization, agregar:
+Key: authorization
+Value: Bearer token
+No enviar el mismo metadata duplicado en ambas pestañas.
+
+IMPORTANTE SOBRE LOS JSON
+-------------------------
+Los ejemplos usan snake_case, tal como los nombres de campos del .proto:
+device_id, device_name, sync_id, local_revision, base_revision, etc.
+
+Orden sugerido
+--------------
+1. RegisterDevice
+2. GetSyncPlan
+3. UploadFile (streaming: header y luego chunk)
+4. CommitSync
+5. DownloadFile
+6. WatchChanges (streaming)
+
+1) RegisterDevice
+-----------------
+Metodo: FileSync / RegisterDevice
+Enviar:
+{
+  "device_id": "canari",
+  "device_name": "Equipo Canari",
+  "platform": "windows"
+}
+
+Respuesta esperada: device_id y user_id.
+Use siempre el mismo device_id en las demas llamadas.
+
+2) GetSyncPlan
+--------------
+Metodo: FileSync / GetSyncPlan
+Este ejemplo corresponde al archivo de prueba sync-smoke.txt con contenido
+"prueba file sync" (16 bytes).
+Enviar:
+{
+  "device_id": "canari",
+  "entries": [
+    {
+      "path": "sync-smoke.txt",
+      "sha256": "f70951becf9e8f8777a3e14475313c4880091619fe3fad9b25689f3e7885be48",
+      "local_revision": "",
+      "deleted": false
+    }
+  ]
+}
+
+Copiar el sync_id de la respuesta. En UploadFile y CommitSync se debe usar
+ese mismo identificador. Si se vuelve a pedir un plan, usar el sync_id mas
+reciente.
+
+3) UploadFile (client streaming)
+-------------------------------
+Metodo: FileSync / UploadFile
+Es una sola llamada de streaming con dos mensajes. No cambie de metodo entre
+mensajes. En Postman, enviar cada mensaje con Send y terminar con End Streaming.
+
+Mensaje 1: header. Reemplazar PEGAR_SYNC_ID por el sync_id de GetSyncPlan.
+{
+  "header": {
+    "sync_id": "PEGAR_SYNC_ID",
+    "device_id": "canari",
+    "path": "sync-smoke.txt",
+    "sha256": "f70951becf9e8f8777a3e14475313c4880091619fe3fad9b25689f3e7885be48",
+    "size": 16,
+    "base_revision": ""
+  }
+}
+
+Pulsar Send. Mantener abierta la llamada/stream.
+
+Mensaje 2: bytes del archivo de prueba codificados en Base64.
+{
+  "chunk": "cHJ1ZWJhIGZpbGUgc3luYw=="
+}
+
+Pulsar Send y luego End Streaming. Respuesta esperada: sync_id, path,
+bytes_received igual a 16 y el SHA-256 indicado arriba.
+
+4) CommitSync
+-------------
+Metodo: FileSync / CommitSync
+Usar el sync_id de GetSyncPlan/UploadFile.
+{
+  "sync_id": "PEGAR_SYNC_ID",
+  "device_id": "canari",
+  "operations": [
+    {
+      "kind": "UPSERT",
+      "path": "sync-smoke.txt",
+      "sync_id": "PEGAR_SYNC_ID",
+      "base_revision": ""
+    }
+  ]
+}
+
+Respuesta esperada: resultado para el archivo con revision, branch y conflict.
+Guardar la revision para probar DownloadFile.
+
+5) DownloadFile (server streaming)
+----------------------------------
+Metodo: FileSync / DownloadFile
+Pegar la revision devuelta por CommitSync.
+{
+  "device_id": "canari",
+  "path": "sync-smoke.txt",
+  "revision": "PEGAR_REVISION"
+}
+
+La respuesta contiene uno o mas mensajes FileChunk. El campo data esta en
+Base64; para el archivo de prueba debe decodificar a "prueba file sync".
+
+6) WatchChanges (server streaming)
+----------------------------------
+Metodo: FileSync / WatchChanges
+{
+  "device_id": "canari",
+  "after_revision": ""
+}
+
+La llamada queda abierta mientras espera cambios. Para terminar la prueba,
+usar Cancel/Stop en Postman. Despues de CommitSync, puede aparecer un evento
+FILE_UPDATED. Si el cliente se reconecta, debe pedir GetSyncPlan nuevamente.
+
+Prueba opcional de borrado
+--------------------------
+Para registrar un borrado global, llamar CommitSync con:
+{
+  "sync_id": "PEGAR_SYNC_ID_NUEVO",
+  "device_id": "canari",
+  "operations": [
+    {
+      "kind": "DELETE",
+      "path": "sync-smoke.txt",
+      "sync_id": "PEGAR_SYNC_ID_NUEVO",
+      "base_revision": "PEGAR_REVISION_ACTUAL"
+    }
+  ]
+}
+
+Usar el sync_id de un GetSyncPlan reciente y la revision actual del archivo.
+El borrado se registra como tombstone; no elimina necesariamente de inmediato
+los blobs/versiones historicas del almacenamiento.
+
+Notas de diagnostico
+-------------------
+- "dispositivo no registrado para este usuario": ejecutar RegisterDevice con
+  el mismo device_id y el mismo token/usuario.
+- CommitSync con error de archivo temporal: reiniciar el servidor despues de
+  actualizar el codigo, y repetir GetSyncPlan, UploadFile y CommitSync. No
+  reutilizar una carga anterior cuyo temporal ya no exista.
+- Si UploadFile responde OK pero CommitSync falla, revisar la salida/log del
+  servidor. UploadFile debe conservar el temporal validado hasta el commit.

@@ -1,0 +1,318 @@
+# Go gRPC File Sync — Guía de instalación y ejecución
+
+## 1. Descripción
+
+Este proyecto implementa un prototipo de sincronización de archivos mediante **Go y gRPC**, con comunicación protegida mediante TLS y autenticación mediante un token Bearer.
+
+El servicio expone las siguientes operaciones:
+
+* `RegisterDevice`: registra un dispositivo asociado a un usuario.
+* `GetSyncPlan`: solicita un plan de sincronización.
+* `UploadFile`: permite enviar archivos al servidor mediante streaming.
+* `DownloadFile`: permite descargar archivos mediante streaming.
+* `WatchChanges`: permite recibir eventos de cambios.
+* `CommitSync`: permite confirmar una sincronización.
+
+La guía documenta la configuración realizada en Windows y las pruebas ejecutadas hasta el momento.
+
+## 2. Requisitos previos
+
+Instalar o disponer de las siguientes herramientas:
+
+* **Go 1.25 o superior.**
+* **Protocol Buffers Compiler (`protoc`)**, para compilar las definiciones `.proto`.
+* Los complementos de Go para Protocol Buffers y gRPC.
+* **grpcurl**, para invocar los métodos gRPC desde la terminal.
+* PowerShell en Windows.
+
+Verificar las instalaciones:
+
+```powershell
+go version
+protoc --version
+grpcurl --version
+```
+
+En este entorno, `grpcurl.exe` se encuentra en:
+
+```text
+C:\Users\diego\go\bin\grpcurl.exe
+```
+
+## 3. Estructura del proyecto
+
+El proyecto utiliza la siguiente organización:
+
+```text
+file sync/
+├── api/
+│   └── filesync/
+│       └── v1/
+│           └── filesync.proto
+├── cmd/
+│   └── server/
+├── generate.ps1
+├── go.mod
+└── go.sum
+```
+
+El archivo `filesync.proto` define el servicio y los mensajes utilizados para la comunicación entre cliente y servidor.
+
+## 4. Preparación del proyecto
+
+Abrir PowerShell y entrar en la carpeta raíz:
+
+```powershell
+cd "C:\Users\diego\Desktop\file sync"
+```
+
+Descargar y organizar las dependencias del proyecto:
+
+```powershell
+go mod tidy
+```
+
+Generar el código Go a partir de las definiciones Protocol Buffers:
+
+```powershell
+.\generate.ps1
+```
+
+Si PowerShell bloquea la ejecución del script, se puede habilitar temporalmente para la sesión actual:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+```
+
+Después, volver a ejecutar `.\generate.ps1`.
+
+## 5. Configuración de TLS
+
+El servidor utiliza un certificado TLS y su clave privada para proteger las conexiones gRPC.
+
+Los archivos generados y utilizados durante la configuración están ubicados en:
+
+```text
+C:\filesync\certs\
+├── server.crt
+├── server.key
+└── server.pfx
+```
+
+El servidor utiliza `server.crt` y `server.key`. El archivo `server.pfx` se conserva como parte de la configuración del certificado.
+
+El certificado se creó para `localhost` y el archivo `server.crt` se convirtió a formato PEM.
+
+**Nota de seguridad:** el certificado es autofirmado y se utiliza para las pruebas locales. En un entorno de producción se debe configurar un certificado confiable y validar correctamente la identidad del servidor.
+
+## 6. Configuración de variables de entorno
+
+Antes de iniciar el servidor, configurar las variables de entorno en PowerShell:
+
+```powershell
+$env:FILESYNC_USER_ID = "usuario"
+$env:FILESYNC_TOKEN = "token"
+$env:FILESYNC_TLS_CERT = "C:\filesync\certs\server.crt"
+$env:FILESYNC_TLS_KEY = "C:\filesync\certs\server.key"
+$env:FILESYNC_DATA_DIR = "C:\filesync\data"
+```
+
+Crear el directorio destinado a los datos:
+
+```powershell
+New-Item -ItemType Directory -Force -Path "C:\filesync\data"
+```
+
+Las variables tienen los siguientes propósitos:
+
+| Variable            | Descripción                                                     |
+| ------------------- | --------------------------------------------------------------- |
+| `FILESYNC_USER_ID`  | Identificador del usuario asociado al token.                    |
+| `FILESYNC_TOKEN`    | Token utilizado para autenticar las solicitudes.                |
+| `FILESYNC_TLS_CERT` | Ruta del certificado TLS.                                       |
+| `FILESYNC_TLS_KEY`  | Ruta de la clave privada TLS.                                   |
+| `FILESYNC_DATA_DIR` | Directorio destinado a los datos administrados por el servidor. |
+
+En esta configuración de prueba, el usuario es `usuario` y el token es `token`. Estos valores son de demostración y deben reemplazarse por credenciales apropiadas fuera del entorno local.
+
+Las variables configuradas mediante `$env:` solo están disponibles en esa sesión de PowerShell y en los procesos que se ejecuten desde ella.
+
+## 7. Ejecución del servidor
+
+En la misma terminal donde se configuraron las variables de entorno, ejecutar:
+
+```powershell
+go run .\cmd\server
+```
+
+Mantener abierta esta terminal mientras se realizan las pruebas.
+
+El servidor utiliza el puerto `8443` en la configuración probada.
+
+Para ejecutar los comandos de validación, abrir una segunda terminal de PowerShell y entrar nuevamente en la raíz del proyecto:
+
+```powershell
+cd "C:\Users\diego\Desktop\file sync"
+```
+
+## 8. Verificación del servicio gRPC
+
+Para consultar los métodos disponibles en el servicio:
+
+```powershell
+& "$env:USERPROFILE\go\bin\grpcurl.exe" `
+    -insecure `
+    -proto ".\api\filesync\v1\filesync.proto" `
+    localhost:8443 list filesync.v1.FileSync
+```
+
+La respuesta obtenida fue:
+
+```text
+filesync.v1.FileSync.CommitSync
+filesync.v1.FileSync.DownloadFile
+filesync.v1.FileSync.GetSyncPlan
+filesync.v1.FileSync.RegisterDevice
+filesync.v1.FileSync.UploadFile
+filesync.v1.FileSync.WatchChanges
+```
+
+Esta comprobación permite verificar que el servidor está escuchando y que `grpcurl` puede consultar los métodos definidos en el archivo `.proto`.
+
+Se utiliza `-proto` porque el servidor no tiene habilitada la reflexión gRPC. La opción `-insecure` permite realizar estas pruebas con el certificado autofirmado, sin validar su cadena de confianza.
+
+## 9. Prueba de registro de dispositivos
+
+El método `RegisterDevice` recibe los campos `device_id`, `device_name` y `platform`, además del encabezado de autenticación.
+
+La solicitud utiliza el siguiente formato JSON:
+
+```json
+{
+  "device_id": "laptop-01",
+  "device_name": "Portátil Diego",
+  "platform": "windows"
+}
+```
+
+Ejecutar desde PowerShell:
+
+```powershell
+$body = '{"device_id":"laptop-01","device_name":"Portátil Diego","platform":"windows"}'
+
+$body | & "$env:USERPROFILE\go\bin\grpcurl.exe" `
+    -insecure `
+    -proto ".\api\filesync\v1\filesync.proto" `
+    -H "authorization: Bearer token" `
+    -d '@' `
+    localhost:8443 filesync.v1.FileSync/RegisterDevice
+```
+
+El encabezado debe contener el mismo token configurado en `FILESYNC_TOKEN`.
+
+La respuesta obtenida fue:
+
+```json
+{
+  "deviceId": "laptop-01",
+  "userId": "usuario"
+}
+```
+
+Esto confirma que el servidor aceptó la solicitud, registró el dispositivo y lo asoció al usuario correspondiente al token.
+
+En este comando, `-d '@'` indica a `grpcurl` que lea el JSON desde la entrada estándar. Esta forma evita los problemas de comillas que pueden aparecer al pasar JSON directamente como argumento desde PowerShell.
+
+## 10. Prueba de consulta del plan de sincronización
+
+Una vez registrado el dispositivo, se puede consultar su plan de sincronización mediante `GetSyncPlan`.
+
+Para la prueba inicial se envía un manifiesto vacío:
+
+```json
+{
+  "device_id": "laptop-01",
+  "entries": []
+}
+```
+
+Ejecutar:
+
+```powershell
+$body = '{"device_id":"laptop-01","entries":[]}'
+
+$body | & "$env:USERPROFILE\go\bin\grpcurl.exe" `
+    -insecure `
+    -proto ".\api\filesync\v1\filesync.proto" `
+    -H "authorization: Bearer token" `
+    -d '@' `
+    localhost:8443 filesync.v1.FileSync/GetSyncPlan
+```
+
+La respuesta obtenida fue:
+
+```json
+{
+  "syncId": "laptop-01-1791572191326177700"
+}
+```
+
+El identificador `syncId` corresponde a la operación de sincronización iniciada por la solicitud.
+
+Esta prueba confirma que el método aceptó la petición y devolvió un identificador. Por sí sola, no demuestra que se hayan transferido archivos ni que se hayan detectado diferencias entre archivos locales y remotos.
+
+## 11. Estado de las pruebas
+
+| Prueba                                     | Resultado           |
+| ------------------------------------------ | ------------------- |
+| Inicio del servidor                        | Correcto            |
+| Consulta de métodos con `grpcurl`          | Correcta            |
+| Autenticación mediante Bearer token        | Aceptada            |
+| Registro del dispositivo `laptop-01`       | Correcto            |
+| Consulta de `GetSyncPlan`                  | Correcta            |
+| Transferencia de archivos con `UploadFile` | Pendiente de probar |
+| Descarga de archivos con `DownloadFile`    | Pendiente de probar |
+| Recepción de cambios con `WatchChanges`    | Pendiente de probar |
+| Confirmación mediante `CommitSync`         | Pendiente de probar |
+
+## 12. Solución de problemas
+
+### El servidor no inicia
+
+* Verificar que los archivos `server.crt` y `server.key` existan en las rutas configuradas.
+* Comprobar que el proceso tenga permisos para leer los archivos y escribir en el directorio de datos.
+* Revisar el mensaje de error mostrado por `go run .\cmd\server`.
+
+### No se puede establecer la conexión
+
+* Confirmar que el servidor siga ejecutándose.
+* Verificar que esté escuchando en el puerto `8443`.
+* Confirmar que se está usando `localhost:8443` desde el mismo equipo.
+
+### Error de autenticación
+
+* Revisar que el encabezado tenga el formato `authorization: Bearer token`.
+* Comprobar que el token enviado coincida con `FILESYNC_TOKEN` en el servidor.
+
+### Error al interpretar el JSON
+
+* Verificar los nombres de los campos y la estructura del mensaje.
+* En PowerShell, utilizar la forma `$body | grpcurl ... -d '@'` mostrada en esta guía para evitar problemas de comillas.
+
+### Error relacionado con el certificado
+
+* Confirmar que `server.crt` esté en formato PEM.
+* Verificar que la clave privada corresponda al certificado.
+* Recordar que `-insecure` se utiliza únicamente para estas pruebas; no sustituye la validación del certificado en producción.
+
+## 13. Próximas pruebas
+
+Una vez validadas la conexión, la autenticación y la creación del plan de sincronización, los siguientes pasos son:
+
+1. Revisar la definición de `UploadFrame` en `filesync.proto` para preparar una solicitud de carga compatible con el protocolo.
+2. Subir un archivo pequeño y comprobar que quede almacenado en el servidor.
+3. Descargar el archivo y verificar que su contenido coincida con el original.
+4. Probar la notificación de cambios mediante `WatchChanges`.
+5. Verificar el comportamiento de `CommitSync` y la finalización del ciclo de sincronización.
+
+Estas pruebas permitirán evaluar el flujo de transferencia de archivos, más allá de las comprobaciones iniciales de conexión y registro de dispositivos.
