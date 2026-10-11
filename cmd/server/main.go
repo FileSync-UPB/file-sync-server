@@ -2,14 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
@@ -41,26 +47,55 @@ type database struct {
 type staged struct{ file, hash, device string }
 type fileSyncServer struct {
 	pb.UnimplementedFileSyncServer
-	mu                sync.Mutex
-	root              string
-	mysqldb           *sql.DB
-	db                database
-	staging           map[string]staged
-	watchers          map[chan *pb.ChangeEvent]bool
+	mu       sync.Mutex
+	root     string
+	mysqldb  *sql.DB
+	db       database
+	staging  map[string]staged
+	watchers map[chan *pb.ChangeEvent]bool
 }
 
 func newServer(root string) (*fileSyncServer, error) {
 	dbHost := os.Getenv("MYSQL_HOST")
-	if dbHost == "" { dbHost = "fylesync-mysql" }
+	if dbHost == "" {
+		dbHost = "db"
+	}
 	dbPort := os.Getenv("MYSQL_PORT")
-	if dbPort == "" { dbPort = "3306" }
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", 
-		os.Getenv("MYSQL_USER"), os.Getenv("MYSQL_PASSWORD"), 
-		dbHost, dbPort, os.Getenv("MYSQL_DATABASE"))
-	
-	mysqldb, err := sql.Open("mysql", dsn)
-	if err != nil { return nil, err }
-	if err = mysqldb.Ping(); err != nil { return nil, err }
+	if dbPort == "" {
+		dbPort = "3306"
+	}
+	dbUser := os.Getenv("MYSQL_USER")
+	if dbUser == "" {
+		dbUser = "upb_app"
+	}
+	dbPass := os.Getenv("MYSQL_PASSWORD")
+	if dbPass == "" {
+		dbPass = "secret_password"
+	}
+	dbName := os.Getenv("MYSQL_DATABASE")
+	if dbName == "" {
+		dbName = "fylesync_users"
+	}
+
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true",
+		dbUser, dbPass, dbHost, dbPort, dbName)
+
+	var mysqldb *sql.DB
+	var err error
+	for attempts := 1; attempts <= 10; attempts++ {
+		mysqldb, err = sql.Open("mysql", dsn)
+		if err == nil {
+			if err = mysqldb.Ping(); err == nil {
+				log.Printf("Conexión exitosa a MySQL (%s:%s)", dbHost, dbPort)
+				break
+			}
+		}
+		log.Printf("Esperando a MySQL (%s:%s)... intento %d/10: %v", dbHost, dbPort, attempts, err)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("no se pudo conectar a MySQL: %w", err)
+	}
 
 	s := &fileSyncServer{root: root, mysqldb: mysqldb, db: database{Devices: map[string]string{}}, staging: map[string]staged{}, watchers: map[chan *pb.ChangeEvent]bool{}}
 	if e := os.MkdirAll(filepath.Join(root, "blobs"), 0700); e != nil {
@@ -367,6 +402,21 @@ func (s *fileSyncServer) CommitSync(ctx context.Context, q *pb.CommitSyncRequest
 				return nil, e
 			}
 			delete(s.staging, op.GetSyncId()+"|"+p)
+
+			// Espejar archivo al repositorio central del usuario
+			userHomePath := filepath.Join(s.root, username, filepath.FromSlash(p))
+			if e = os.MkdirAll(filepath.Dir(userHomePath), 0755); e == nil {
+				if src, e := os.Open(r.Blob); e == nil {
+					if dst, e := os.Create(userHomePath); e == nil {
+						io.Copy(dst, src)
+						dst.Close()
+					}
+					src.Close()
+				}
+			}
+		} else if op.GetKind() == pb.CommitKind_DELETE {
+			userHomePath := filepath.Join(s.root, username, filepath.FromSlash(p))
+			os.Remove(userHomePath)
 		}
 		s.db.Revisions = append(s.db.Revisions, r)
 		if e = s.saveLocked(); e != nil {
@@ -387,6 +437,64 @@ func (s *fileSyncServer) CommitSync(ctx context.Context, q *pb.CommitSyncRequest
 	}
 	return out, nil
 }
+
+func generateSelfSignedCert(certPath, keyPath string) error {
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject: pkix.Name{
+			Organization: []string{"UPB Fylesync Enterprise"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("0.0.0.0")},
+		DNSNames:              []string{"localhost", "file-sync-server", "fylesync-file-sync"},
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(filepath.Dir(certPath), 0755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(keyPath), 0755); err != nil {
+		return err
+	}
+
+	certOut, err := os.Create(certPath)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: certDER}); err != nil {
+		certOut.Close()
+		return err
+	}
+	certOut.Close()
+
+	keyOut, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}); err != nil {
+		keyOut.Close()
+		return err
+	}
+	keyOut.Close()
+
+	log.Printf("Certificado TLS autofirmado generado en %s y %s", certPath, keyPath)
+	return nil
+}
+
 func main() {
 	if err := godotenv.Load(); err != nil {
 		log.Println("No se encontró el archivo .env; se usarán las variables del sistema")
@@ -405,11 +513,17 @@ func main() {
 	}
 	cert, key := os.Getenv("FILESYNC_TLS_CERT"), os.Getenv("FILESYNC_TLS_KEY")
 	if cert == "" || key == "" {
-		log.Fatal("defina FILESYNC_TLS_CERT y FILESYNC_TLS_KEY; servidor cerrado sin TLS")
+		cert = filepath.Join(root, "certs", "server.crt")
+		key = filepath.Join(root, "certs", "server.key")
+		if _, err := os.Stat(cert); os.IsNotExist(err) {
+			if err := generateSelfSignedCert(cert, key); err != nil {
+				log.Fatalf("Error generando certificado TLS: %v", err)
+			}
+		}
 	}
 	creds, e := credentials.NewServerTLSFromFile(cert, key)
 	if e != nil {
-		log.Fatal(e)
+		log.Fatalf("Error cargando credenciales TLS: %v", e)
 	}
 	lis, e := net.Listen("tcp", addr)
 	if e != nil {
@@ -417,7 +531,7 @@ func main() {
 	}
 	g := grpc.NewServer(grpc.Creds(creds))
 	pb.RegisterFileSyncServer(g, s)
-	log.Printf("File Sync gRPC en %s", addr)
+	log.Printf("File Sync gRPC TLS activo en %s (Almacenamiento: %s)", addr, root)
 	if e = g.Serve(lis); e != nil {
 		log.Fatal(e)
 	}
