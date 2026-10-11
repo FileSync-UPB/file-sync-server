@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"crypto/subtle"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,6 +19,7 @@ import (
 
 	pb "filesync-prototype/api/filesync/v1"
 
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/joho/godotenv"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -41,17 +42,27 @@ type staged struct{ file, hash, device string }
 type fileSyncServer struct {
 	pb.UnimplementedFileSyncServer
 	mu                sync.Mutex
-	root, token, user string
+	root              string
+	mysqldb           *sql.DB
 	db                database
 	staging           map[string]staged
 	watchers          map[chan *pb.ChangeEvent]bool
 }
 
-func newServer(root, token, user string) (*fileSyncServer, error) {
-	if token == "" || user == "" {
-		return nil, errors.New("FILESYNC_TOKEN y FILESYNC_USER_ID son obligatorios")
-	}
-	s := &fileSyncServer{root: root, token: token, user: user, db: database{Devices: map[string]string{}}, staging: map[string]staged{}, watchers: map[chan *pb.ChangeEvent]bool{}}
+func newServer(root string) (*fileSyncServer, error) {
+	dbHost := os.Getenv("MYSQL_HOST")
+	if dbHost == "" { dbHost = "fylesync-mysql" }
+	dbPort := os.Getenv("MYSQL_PORT")
+	if dbPort == "" { dbPort = "3306" }
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true", 
+		os.Getenv("MYSQL_USER"), os.Getenv("MYSQL_PASSWORD"), 
+		dbHost, dbPort, os.Getenv("MYSQL_DATABASE"))
+	
+	mysqldb, err := sql.Open("mysql", dsn)
+	if err != nil { return nil, err }
+	if err = mysqldb.Ping(); err != nil { return nil, err }
+
+	s := &fileSyncServer{root: root, mysqldb: mysqldb, db: database{Devices: map[string]string{}}, staging: map[string]staged{}, watchers: map[chan *pb.ChangeEvent]bool{}}
 	if e := os.MkdirAll(filepath.Join(root, "blobs"), 0700); e != nil {
 		return nil, e
 	}
@@ -77,21 +88,26 @@ func (s *fileSyncServer) saveLocked() error {
 	}
 	return os.Rename(tmp, filepath.Join(s.root, "state.json"))
 }
-func (s *fileSyncServer) auth(ctx context.Context) error {
+func (s *fileSyncServer) auth(ctx context.Context) (string, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
-		return errors.New("falta token")
+		return "", errors.New("falta token")
 	}
 	for _, v := range md.Get("authorization") {
-		got := strings.TrimPrefix(v, "Bearer ")
-		if len(got) == len(s.token) && subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1 {
-			return nil
+		token := strings.TrimPrefix(v, "Bearer ")
+		hash := sha256.Sum256([]byte(token))
+		hashStr := hex.EncodeToString(hash[:])
+		
+		var username string
+		err := s.mysqldb.QueryRow("SELECT username FROM auth_tokens WHERE token_hash = ? AND active = 1 AND expires_at > NOW()", hashStr).Scan(&username)
+		if err == nil {
+			return username, nil
 		}
 	}
-	return errors.New("token inválido")
+	return "", errors.New("token inválido")
 }
-func (s *fileSyncServer) checkDevice(id string) error {
-	if id == "" || s.db.Devices[id] != s.user {
+func (s *fileSyncServer) checkDevice(id string, username string) error {
+	if id == "" || s.db.Devices[id] != username {
 		return errors.New("dispositivo no registrado para este usuario")
 	}
 	return nil
@@ -113,7 +129,8 @@ func (s *fileSyncServer) head(p string) (revision, bool) {
 	return revision{}, false
 }
 func (s *fileSyncServer) RegisterDevice(ctx context.Context, q *pb.RegisterDeviceRequest) (*pb.RegisterDeviceResponse, error) {
-	if e := s.auth(ctx); e != nil {
+	username, e := s.auth(ctx)
+	if e != nil {
 		return nil, e
 	}
 	if q.GetDeviceId() == "" {
@@ -121,19 +138,20 @@ func (s *fileSyncServer) RegisterDevice(ctx context.Context, q *pb.RegisterDevic
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.db.Devices[q.GetDeviceId()] = s.user
+	s.db.Devices[q.GetDeviceId()] = username
 	if e := s.saveLocked(); e != nil {
 		return nil, e
 	}
-	return &pb.RegisterDeviceResponse{DeviceId: q.GetDeviceId(), UserId: s.user}, nil
+	return &pb.RegisterDeviceResponse{DeviceId: q.GetDeviceId(), UserId: username}, nil
 }
 func (s *fileSyncServer) GetSyncPlan(ctx context.Context, q *pb.GetSyncPlanRequest) (*pb.GetSyncPlanResponse, error) {
-	if e := s.auth(ctx); e != nil {
+	username, e := s.auth(ctx)
+	if e != nil {
 		return nil, e
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e := s.checkDevice(q.GetDeviceId()); e != nil {
+	if e := s.checkDevice(q.GetDeviceId(), username); e != nil {
 		return nil, e
 	}
 	out := &pb.GetSyncPlanResponse{SyncId: fmt.Sprintf("%s-%d", q.GetDeviceId(), time.Now().UnixNano())}
@@ -157,7 +175,8 @@ func (s *fileSyncServer) GetSyncPlan(ctx context.Context, q *pb.GetSyncPlanReque
 	return out, nil
 }
 func (s *fileSyncServer) UploadFile(stream grpc.ClientStreamingServer[pb.UploadFrame, pb.UploadFileResponse]) error {
-	if e := s.auth(stream.Context()); e != nil {
+	username, e := s.auth(stream.Context())
+	if e != nil {
 		return e
 	}
 	first, e := stream.Recv()
@@ -173,7 +192,7 @@ func (s *fileSyncServer) UploadFile(stream grpc.ClientStreamingServer[pb.UploadF
 		return e
 	}
 	s.mu.Lock()
-	e = s.checkDevice(head.GetDeviceId())
+	e = s.checkDevice(head.GetDeviceId(), username)
 	s.mu.Unlock()
 	if e != nil {
 		return e
@@ -229,7 +248,8 @@ func (s *fileSyncServer) UploadFile(stream grpc.ClientStreamingServer[pb.UploadF
 	return stream.SendAndClose(&pb.UploadFileResponse{SyncId: head.GetSyncId(), Path: p, BytesReceived: size, Sha256: sum})
 }
 func (s *fileSyncServer) DownloadFile(q *pb.DownloadFileRequest, stream grpc.ServerStreamingServer[pb.FileChunk]) error {
-	if e := s.auth(stream.Context()); e != nil {
+	username, e := s.auth(stream.Context())
+	if e != nil {
 		return e
 	}
 	p, e := cleanPath(q.GetPath())
@@ -237,7 +257,7 @@ func (s *fileSyncServer) DownloadFile(q *pb.DownloadFileRequest, stream grpc.Ser
 		return e
 	}
 	s.mu.Lock()
-	if e = s.checkDevice(q.GetDeviceId()); e != nil {
+	if e = s.checkDevice(q.GetDeviceId(), username); e != nil {
 		s.mu.Unlock()
 		return e
 	}
@@ -285,11 +305,12 @@ func (s *fileSyncServer) DownloadFile(q *pb.DownloadFileRequest, stream grpc.Ser
 	return nil
 }
 func (s *fileSyncServer) WatchChanges(q *pb.WatchChangesRequest, stream grpc.ServerStreamingServer[pb.ChangeEvent]) error {
-	if e := s.auth(stream.Context()); e != nil {
+	username, e := s.auth(stream.Context())
+	if e != nil {
 		return e
 	}
 	s.mu.Lock()
-	if e := s.checkDevice(q.GetDeviceId()); e != nil {
+	if e := s.checkDevice(q.GetDeviceId(), username); e != nil {
 		s.mu.Unlock()
 		return e
 	}
@@ -309,12 +330,13 @@ func (s *fileSyncServer) WatchChanges(q *pb.WatchChangesRequest, stream grpc.Ser
 	}
 }
 func (s *fileSyncServer) CommitSync(ctx context.Context, q *pb.CommitSyncRequest) (*pb.CommitSyncResponse, error) {
-	if e := s.auth(ctx); e != nil {
+	username, e := s.auth(ctx)
+	if e != nil {
 		return nil, e
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if e := s.checkDevice(q.GetDeviceId()); e != nil {
+	if e := s.checkDevice(q.GetDeviceId(), username); e != nil {
 		return nil, e
 	}
 	out := &pb.CommitSyncResponse{}
@@ -371,9 +393,9 @@ func main() {
 	}
 	root := os.Getenv("FILESYNC_DATA_DIR")
 	if root == "" {
-		root = "./data"
+		root = "/var/fylesync/home"
 	}
-	s, e := newServer(root, os.Getenv("FILESYNC_TOKEN"), os.Getenv("FILESYNC_USER_ID"))
+	s, e := newServer(root)
 	if e != nil {
 		log.Fatal(e)
 	}
