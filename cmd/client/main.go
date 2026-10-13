@@ -93,7 +93,7 @@ func main() {
 
 	ctx := metadata.AppendToOutgoingContext(context.Background(), "authorization", "Bearer "+cfg.token)
 
-	// Siempre asegurar el registro del dispositivo
+	// registro del dispositivo
 	regResp, err := client.RegisterDevice(ctx, &pb.RegisterDeviceRequest{
 		DeviceId:   cfg.deviceID,
 		DeviceName: cfg.deviceName,
@@ -127,6 +127,7 @@ func main() {
 	}
 }
 
+// Se encarga de abrir la conexión gRPC con el servidor.
 func connectGRPC(serverAddr string) (pb.FileSyncClient, *grpc.ClientConn, error) {
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true, // Permitir certificados autofirmados del servidor local
@@ -208,8 +209,10 @@ func runPeriodic(ctx context.Context, client pb.FileSyncClient, cfg clientConfig
 	}
 }
 
+/*
+realiza la sincronizacion completa
+*/
 func performSync(ctx context.Context, client pb.FileSyncClient, cfg clientConfig) error {
-	log.Printf("==================================================")
 	log.Printf("[INICIO] Sincronizando directorio local: %s", cfg.localDir)
 
 	if cfg.wifiOnly {
@@ -241,7 +244,7 @@ func performSync(ctx context.Context, client pb.FileSyncClient, cfg clientConfig
 	log.Printf("[PLAN] Recibidas %d instrucciones del servidor (SyncID: %s)", len(changes), planResp.GetSyncId())
 
 	var commitOps []*pb.CommitOperation
-
+	// se recorre cada cambio
 	for _, ch := range changes {
 		switch ch.GetAction() {
 		case pb.SyncAction_UPLOAD:
@@ -301,10 +304,10 @@ func performSync(ctx context.Context, client pb.FileSyncClient, cfg clientConfig
 	}
 
 	log.Printf("[FIN] Sincronización completada exitosamente.")
-	log.Printf("==================================================")
 	return nil
 }
 
+// recorre el directorio local y crea una lista de entradas
 func buildLocalManifest(baseDir string) ([]*pb.ManifestEntry, error) {
 	var entries []*pb.ManifestEntry
 
@@ -338,6 +341,7 @@ func buildLocalManifest(baseDir string) ([]*pb.ManifestEntry, error) {
 	return entries, err
 }
 
+// Calcula el hash SHA256 de un archivo.
 func hashFile(filePath string) (string, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
@@ -352,6 +356,7 @@ func hashFile(filePath string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// Sube un archivo local al servidor usando streaming gRPC.
 func uploadLocalFile(ctx context.Context, client pb.FileSyncClient, cfg clientConfig, syncID, relPath string) (string, error) {
 	fullPath := filepath.Join(cfg.localDir, filepath.FromSlash(relPath))
 	file, err := os.Open(fullPath)
@@ -420,6 +425,7 @@ func uploadLocalFile(ctx context.Context, client pb.FileSyncClient, cfg clientCo
 	return resp.GetSha256(), nil
 }
 
+// Descarga un archivo desde el servidor al directorio local.
 func downloadRemoteFile(ctx context.Context, client pb.FileSyncClient, cfg clientConfig, relPath, revision string) error {
 	fullPath := filepath.Join(cfg.localDir, filepath.FromSlash(relPath))
 	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {

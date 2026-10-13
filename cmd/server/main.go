@@ -41,10 +41,10 @@ type revision struct {
 	Created                      time.Time
 }
 type database struct {
-	Devices   map[string]string
+	Devices   map[string]string //mapa de deviceID y username
 	Revisions []revision
 }
-type staged struct{ file, hash, device string }
+type staged struct{ file, hash, device string } //archivo temporal
 type fileSyncServer struct {
 	pb.UnimplementedFileSyncServer
 	mu       sync.Mutex
@@ -55,7 +55,7 @@ type fileSyncServer struct {
 	watchers map[chan *pb.ChangeEvent]bool
 }
 
-func newServer(root string) (*fileSyncServer, error) {
+func newServer(root string) (*fileSyncServer, error) { //constructor
 	dbHost := os.Getenv("MYSQL_HOST")
 	if dbHost == "" {
 		dbHost = "db"
@@ -82,7 +82,7 @@ func newServer(root string) (*fileSyncServer, error) {
 
 	var mysqldb *sql.DB
 	var err error
-	for attempts := 1; attempts <= 10; attempts++ {
+	for attempts := 1; attempts <= 10; attempts++ { //intenta 10 vece la conexion
 		mysqldb, err = sql.Open("mysql", dsn)
 		if err == nil {
 			if err = mysqldb.Ping(); err == nil {
@@ -112,6 +112,13 @@ func newServer(root string) (*fileSyncServer, error) {
 	}
 	return s, nil
 }
+
+/*
+guarda el estado del servidor en memoria
+serializa s.db a JSON
+escribe a state.json.tmp
+renombra temporal a state.json
+*/
 func (s *fileSyncServer) saveLocked() error {
 	b, e := json.MarshalIndent(s.db, "", "  ")
 	if e != nil {
@@ -123,6 +130,10 @@ func (s *fileSyncServer) saveLocked() error {
 	}
 	return os.Rename(tmp, filepath.Join(s.root, "state.json"))
 }
+
+/*
+valida token del cliente
+*/
 func (s *fileSyncServer) auth(ctx context.Context) (string, error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -132,7 +143,7 @@ func (s *fileSyncServer) auth(ctx context.Context) (string, error) {
 		token := strings.TrimPrefix(v, "Bearer ")
 		hash := sha256.Sum256([]byte(token))
 		hashStr := hex.EncodeToString(hash[:])
-		
+
 		var username string
 		err := s.mysqldb.QueryRow("SELECT username FROM auth_tokens WHERE token_hash = ? AND active = 1 AND expires_at > NOW()", hashStr).Scan(&username)
 		if err == nil {
@@ -140,20 +151,41 @@ func (s *fileSyncServer) auth(ctx context.Context) (string, error) {
 		}
 	}
 	return "", errors.New("token inválido")
+
+	/*
+	   Verifica que un deviceID este asociado a un usuario
+	*/
 }
+
+/*
+revisa que el dispositivo este asociado a un usuario
+*/
 func (s *fileSyncServer) checkDevice(id string, username string) error {
 	if id == "" || s.db.Devices[id] != username {
 		return errors.New("dispositivo no registrado para este usuario")
 	}
 	return nil
 }
+
+/*
+Valida una ruta de archivo
+*/
 func cleanPath(p string) (string, error) {
 	p = filepath.ToSlash(filepath.Clean(filepath.FromSlash(p)))
 	if p == "." || p == ".." || strings.HasPrefix(p, "../") || filepath.IsAbs(p) || strings.Contains(p, ":") {
 		return "", errors.New("ruta no permitida")
 	}
 	return p, nil
+
+	/*
+	   Busca la ultima revision de un archivo en main
+	   recorre en for s.db.revisions para obtener el "head actual"
+	*/
 }
+
+/*
+Busca la ultima revision de un archivo en la rama main
+*/
 func (s *fileSyncServer) head(p string) (revision, bool) {
 	for i := len(s.db.Revisions) - 1; i >= 0; i-- {
 		r := s.db.Revisions[i]
@@ -163,6 +195,10 @@ func (s *fileSyncServer) head(p string) (revision, bool) {
 	}
 	return revision{}, false
 }
+
+/*
+Registra un dispositivo para un usuario autenticado y lo asocia al username
+*/
 func (s *fileSyncServer) RegisterDevice(ctx context.Context, q *pb.RegisterDeviceRequest) (*pb.RegisterDeviceResponse, error) {
 	username, e := s.auth(ctx)
 	if e != nil {
@@ -179,6 +215,13 @@ func (s *fileSyncServer) RegisterDevice(ctx context.Context, q *pb.RegisterDevic
 	}
 	return &pb.RegisterDeviceResponse{DeviceId: q.GetDeviceId(), UserId: username}, nil
 }
+
+/*
+Calcula que cambios hay entre el cliente y el servidor
+si local esta y en server no: lo borra local
+si no existe en server o hash difiere, lo sube
+si coinciden, no hace na'
+*/
 func (s *fileSyncServer) GetSyncPlan(ctx context.Context, q *pb.GetSyncPlanRequest) (*pb.GetSyncPlanResponse, error) {
 	username, e := s.auth(ctx)
 	if e != nil {
@@ -209,6 +252,12 @@ func (s *fileSyncServer) GetSyncPlan(ctx context.Context, q *pb.GetSyncPlanReque
 	}
 	return out, nil
 }
+
+/*
+recibe un archivo en streaming desde el cliente
+el primer frame debe ser el header
+devuelve el SyncId, el path y la llave sha
+*/
 func (s *fileSyncServer) UploadFile(stream grpc.ClientStreamingServer[pb.UploadFrame, pb.UploadFileResponse]) error {
 	username, e := s.auth(stream.Context())
 	if e != nil {
@@ -282,6 +331,11 @@ func (s *fileSyncServer) UploadFile(stream grpc.ClientStreamingServer[pb.UploadF
 	keepStagedFile = true
 	return stream.SendAndClose(&pb.UploadFileResponse{SyncId: head.GetSyncId(), Path: p, BytesReceived: size, Sha256: sum})
 }
+
+/*
+Entrega un archivo al cliente por chunks
+envia bloques de 256kb
+*/
 func (s *fileSyncServer) DownloadFile(q *pb.DownloadFileRequest, stream grpc.ServerStreamingServer[pb.FileChunk]) error {
 	username, e := s.auth(stream.Context())
 	if e != nil {
@@ -339,6 +393,12 @@ func (s *fileSyncServer) DownloadFile(q *pb.DownloadFileRequest, stream grpc.Ser
 	}
 	return nil
 }
+
+/*
+Stream de cambios en vivo
+crea un observer que se queda esperando un evento
+si termina el stream sale, si llega un evento lo envia al cliente
+*/
 func (s *fileSyncServer) WatchChanges(q *pb.WatchChangesRequest, stream grpc.ServerStreamingServer[pb.ChangeEvent]) error {
 	username, e := s.auth(stream.Context())
 	if e != nil {
@@ -364,6 +424,12 @@ func (s *fileSyncServer) WatchChanges(q *pb.WatchChangesRequest, stream grpc.Ser
 		}
 	}
 }
+
+/*
+Confirmacion final de un cambio
+si es upsert, mueve el archivo desde staging a la ruta final y lo copia hacia el repo del usuario
+si es delete, elimina el archivo de la ruta del usuario
+*/
 func (s *fileSyncServer) CommitSync(ctx context.Context, q *pb.CommitSyncRequest) (*pb.CommitSyncResponse, error) {
 	username, e := s.auth(ctx)
 	if e != nil {
@@ -438,6 +504,10 @@ func (s *fileSyncServer) CommitSync(ctx context.Context, q *pb.CommitSyncRequest
 	return out, nil
 }
 
+/*
+genera un certificado TLS autofirmado
+genera cert en .crt y key en .key
+*/
 func generateSelfSignedCert(certPath, keyPath string) error {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
